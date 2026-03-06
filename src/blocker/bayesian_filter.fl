@@ -1,0 +1,557 @@
+/**
+ * FreeLang Monitoring Suite: Bayesian False-Alarm Filter
+ *
+ * 나이브 베이지안 분류기 기반 거짓 알람 필터링
+ *
+ * 무관용 규칙:
+ *   R1: 거짓 알람 필터링 > 95%
+ *   R2: 정상 알람 통과 > 99%
+ *   R3: 처리 지연 < 100ms
+ *   R8: False positive < 0.1%
+ */
+
+// ============================================================================
+// Structures
+// ============================================================================
+
+pub struct AlertFeatures {
+    // Feature 1: Alert frequency in last window
+    frequency_1h: f32,
+    frequency_24h: f32,
+
+    // Feature 2: Value relative to baseline
+    deviation_sigma: f32,       // Z-score from historical mean
+
+    // Feature 3: Duration above threshold
+    duration_sec: f32,
+
+    // Feature 4: Time of day patterns (0=night, 1=business hours)
+    time_of_day_score: f32,
+
+    // Feature 5: Correlation with other metrics
+    correlated_firing: bool,
+
+    // Feature 6: Historical false alarm rate for this metric
+    hist_false_rate: f32,
+
+    // Feature 7: Rate of change (derivative)
+    rate_of_change: f32,
+
+    // Feature 8: Value absolute (not relative)
+    absolute_value: f32,
+}
+
+pub struct BayesianClass {
+    class_name: string,         // "true_alarm" | "false_alarm"
+    prior: f32,                 // P(class)
+    count: u32,
+
+    // Feature likelihoods: P(feature | class)
+    // Stored as Gaussian: mean + std for continuous features
+    freq_1h_mean: f32,
+    freq_1h_std: f32,
+    freq_24h_mean: f32,
+    freq_24h_std: f32,
+    deviation_mean: f32,
+    deviation_std: f32,
+    duration_mean: f32,
+    duration_std: f32,
+    tod_mean: f32,
+    tod_std: f32,
+    hist_false_mean: f32,
+    hist_false_std: f32,
+    roc_mean: f32,
+    roc_std: f32,
+    abs_val_mean: f32,
+    abs_val_std: f32,
+
+    // Discrete feature: correlated_firing
+    corr_fire_prob: f32,        // P(correlated=true | class)
+}
+
+pub struct BayesianFilter {
+    true_alarm_class: BayesianClass,
+    false_alarm_class: BayesianClass,
+    total_trained: u32,
+    decision_threshold: f32,    // P(false_alarm) threshold for suppression
+    smoothing_factor: f32,      // Laplace smoothing
+    min_confidence: f32,        // Min confidence to make decision
+    classification_count: u32,
+    correct_count: u32,
+}
+
+// ============================================================================
+// Initialize
+// ============================================================================
+
+pub fn init_bayesian_class(class_name: string, prior: f32) -> BayesianClass {
+    BayesianClass {
+        class_name: class_name,
+        prior: prior,
+        count: 0,
+        freq_1h_mean: 0.0,
+        freq_1h_std: 1.0,
+        freq_24h_mean: 0.0,
+        freq_24h_std: 1.0,
+        deviation_mean: 2.5,
+        deviation_std: 1.0,
+        duration_mean: 60.0,
+        duration_std: 120.0,
+        tod_mean: 0.5,
+        tod_std: 0.3,
+        hist_false_mean: 0.1,
+        hist_false_std: 0.15,
+        roc_mean: 0.0,
+        roc_std: 0.5,
+        abs_val_mean: 0.0,
+        abs_val_std: 100.0,
+        corr_fire_prob: 0.5,
+    }
+}
+
+pub fn init_bayesian_filter() -> BayesianFilter {
+    // Initialize with strong priors:
+    // Most alerts in noisy systems are false alarms (~70%)
+    BayesianFilter {
+        true_alarm_class: init_bayesian_class("true_alarm", 0.30),
+        false_alarm_class: init_bayesian_class("false_alarm", 0.70),
+        total_trained: 0,
+        decision_threshold: 0.50,    // >50% false alarm = suppress
+        smoothing_factor: 0.001,     // Laplace smoothing
+        min_confidence: 0.60,        // Need 60% confidence
+        classification_count: 0,
+        correct_count: 0,
+    }
+}
+
+// ============================================================================
+// Gaussian PDF for Naive Bayes
+// ============================================================================
+
+fn gaussian_pdf(x: f32, mean: f32, std: f32) -> f32 {
+    if std < 0.0001 {
+        // Degenerate case: point mass at mean
+        diff: f32 = x - mean
+        if diff < 0.0 { diff = -diff }
+        if diff < 0.001 {
+            return 1.0
+        }
+        return 0.001
+    }
+
+    // P(x | μ, σ) = exp(-(x-μ)^2 / (2σ^2)) / (σ * sqrt(2π))
+    exponent: f32 = (x - mean) * (x - mean) / (2.0 * std * std)
+
+    // Clamp exponent to prevent underflow
+    if exponent > 50.0 { exponent = 50.0 }
+
+    // Approximate exp(-x) using polynomial (for speed, R9: < 10µs)
+    result: f32 = exp_approx(-exponent)
+    norm: f32 = std * 2.507    // std * sqrt(2π) ≈ std * 2.5066
+
+    return result / norm
+}
+
+fn exp_approx(x: f32) -> f32 {
+    // Fast exp approximation for x in [-50, 0]
+    if x < -50.0 { return 0.0 }
+    if x >= 0.0 { return 1.0 }
+
+    // Pade approximation (accurate to ~0.1% for small x)
+    // For large negative x: use Taylor series decomposition
+    n_terms: f32 = 1.0
+    term: f32 = 1.0
+    result: f32 = 1.0
+    i: u32 = 1
+    while i <= 10 {
+        term = term * x / float(i)
+        result = result + term
+        i = i + 1
+    }
+    if result < 0.0 { result = 0.0 }
+    return result
+}
+
+fn log_approx(x: f32) -> f32 {
+    // Natural log approximation for x > 0
+    if x <= 0.0 { return -50.0 }
+    if x >= 1.0 {
+        // log(x) = log(x/2) + log(2) for x > 1
+        // Use iterative halving
+        result: f32 = 0.0
+        val: f32 = x
+        while val > 2.0 {
+            val = val / 2.0
+            result = result + 0.693    // ln(2)
+        }
+        // Now 1 <= val <= 2, use series expansion
+        // ln(1+y) ≈ y - y^2/2 + y^3/3 - ... for |y| < 1
+        y: f32 = val - 1.0
+        s: f32 = 0.0
+        term: f32 = y
+        k: u32 = 1
+        while k <= 8 {
+            if k % 2 == 1 {
+                s = s + term / float(k)
+            } else {
+                s = s - term / float(k)
+            }
+            term = term * y
+            k = k + 1
+        }
+        return result + s
+    }
+    // 0 < x < 1
+    result: f32 = 0.0
+    val: f32 = x
+    while val < 0.5 {
+        val = val * 2.0
+        result = result - 0.693
+    }
+    y: f32 = val - 1.0
+    s: f32 = 0.0
+    term: f32 = y
+    k: u32 = 1
+    while k <= 8 {
+        if k % 2 == 1 {
+            s = s + term / float(k)
+        } else {
+            s = s - term / float(k)
+        }
+        term = term * y
+        k = k + 1
+    }
+    return result + s
+}
+
+// ============================================================================
+// Compute Log-Likelihood for a Class
+// ============================================================================
+
+fn class_log_likelihood(
+    cls: BayesianClass,
+    features: AlertFeatures
+) -> f32 {
+    // log P(features | class) = sum of log P(feature_i | class)
+    ll: f32 = log_approx(cls.prior)
+
+    // Continuous features: Gaussian PDF
+    ll = ll + log_approx(gaussian_pdf(features.frequency_1h, cls.freq_1h_mean, cls.freq_1h_std) + 0.0001)
+    ll = ll + log_approx(gaussian_pdf(features.frequency_24h, cls.freq_24h_mean, cls.freq_24h_std) + 0.0001)
+    ll = ll + log_approx(gaussian_pdf(features.deviation_sigma, cls.deviation_mean, cls.deviation_std) + 0.0001)
+    ll = ll + log_approx(gaussian_pdf(features.duration_sec, cls.duration_mean, cls.duration_std) + 0.0001)
+    ll = ll + log_approx(gaussian_pdf(features.time_of_day_score, cls.tod_mean, cls.tod_std) + 0.0001)
+    ll = ll + log_approx(gaussian_pdf(features.hist_false_rate, cls.hist_false_mean, cls.hist_false_std) + 0.0001)
+    ll = ll + log_approx(gaussian_pdf(features.rate_of_change, cls.roc_mean, cls.roc_std) + 0.0001)
+    ll = ll + log_approx(gaussian_pdf(features.absolute_value, cls.abs_val_mean, cls.abs_val_std) + 0.0001)
+
+    // Discrete feature: correlated_firing
+    if features.correlated_firing {
+        ll = ll + log_approx(cls.corr_fire_prob + 0.0001)
+    } else {
+        ll = ll + log_approx(1.0 - cls.corr_fire_prob + 0.0001)
+    }
+
+    return ll
+}
+
+// ============================================================================
+// Classify Alert (R3: < 100ms)
+// ============================================================================
+
+pub struct ClassificationResult {
+    is_false_alarm: bool,
+    false_alarm_prob: f32,
+    true_alarm_prob: f32,
+    confidence: f32,
+    decision: string,           // "suppress" | "fire" | "uncertain"
+}
+
+pub fn classify(filter: BayesianFilter, features: AlertFeatures) -> ClassificationResult {
+    // Compute log-likelihoods
+    ll_true: f32 = class_log_likelihood(filter.true_alarm_class, features)
+    ll_false: f32 = class_log_likelihood(filter.false_alarm_class, features)
+
+    // Convert to probabilities using softmax-like normalization
+    // P(true) ∝ exp(ll_true), P(false) ∝ exp(ll_false)
+    // Use log-sum-exp trick for numerical stability
+    max_ll: f32 = ll_true
+    if ll_false > max_ll { max_ll = ll_false }
+
+    exp_true: f32 = exp_approx(ll_true - max_ll)
+    exp_false: f32 = exp_approx(ll_false - max_ll)
+    total: f32 = exp_true + exp_false
+
+    p_true: f32 = exp_true / total
+    p_false: f32 = exp_false / total
+
+    // Confidence = max(p_true, p_false)
+    confidence: f32 = p_true
+    if p_false > confidence { confidence = p_false }
+
+    // Decision
+    decision: string = "uncertain"
+    is_false: bool = false
+
+    if confidence >= filter.min_confidence {
+        if p_false >= filter.decision_threshold {
+            decision = "suppress"
+            is_false = true
+        } else {
+            decision = "fire"
+        }
+    }
+
+    ClassificationResult {
+        is_false_alarm: is_false,
+        false_alarm_prob: p_false,
+        true_alarm_prob: p_true,
+        confidence: confidence,
+        decision: decision,
+    }
+}
+
+// ============================================================================
+// Online Learning: Update Model with Labeled Sample
+// ============================================================================
+
+fn update_class_stats(
+    cls: BayesianClass,
+    features: AlertFeatures,
+    alpha: f32              // Learning rate
+) -> BayesianClass {
+    // Exponential moving average update for each feature statistic
+    new_freq_1h_mean: f32 = (1.0 - alpha) * cls.freq_1h_mean + alpha * features.frequency_1h
+    new_freq_24h_mean: f32 = (1.0 - alpha) * cls.freq_24h_mean + alpha * features.frequency_24h
+    new_dev_mean: f32 = (1.0 - alpha) * cls.deviation_mean + alpha * features.deviation_sigma
+    new_dur_mean: f32 = (1.0 - alpha) * cls.duration_mean + alpha * features.duration_sec
+    new_tod_mean: f32 = (1.0 - alpha) * cls.tod_mean + alpha * features.time_of_day_score
+    new_hist_mean: f32 = (1.0 - alpha) * cls.hist_false_mean + alpha * features.hist_false_rate
+    new_roc_mean: f32 = (1.0 - alpha) * cls.roc_mean + alpha * features.rate_of_change
+    new_abs_mean: f32 = (1.0 - alpha) * cls.abs_val_mean + alpha * features.absolute_value
+
+    // Update correlation probability
+    corr_signal: f32 = 0.0
+    if features.correlated_firing { corr_signal = 1.0 }
+    new_corr_prob: f32 = (1.0 - alpha) * cls.corr_fire_prob + alpha * corr_signal
+
+    // Update standard deviations (running variance)
+    diff_freq_1h: f32 = features.frequency_1h - new_freq_1h_mean
+    if diff_freq_1h < 0.0 { diff_freq_1h = -diff_freq_1h }
+    new_freq_1h_std: f32 = (1.0 - alpha) * cls.freq_1h_std + alpha * diff_freq_1h
+    if new_freq_1h_std < 0.1 { new_freq_1h_std = 0.1 }
+
+    diff_dev: f32 = features.deviation_sigma - new_dev_mean
+    if diff_dev < 0.0 { diff_dev = -diff_dev }
+    new_dev_std: f32 = (1.0 - alpha) * cls.deviation_std + alpha * diff_dev
+    if new_dev_std < 0.1 { new_dev_std = 0.1 }
+
+    BayesianClass {
+        class_name: cls.class_name,
+        prior: cls.prior,
+        count: cls.count + 1,
+        freq_1h_mean: new_freq_1h_mean,
+        freq_1h_std: new_freq_1h_std,
+        freq_24h_mean: new_freq_24h_mean,
+        freq_24h_std: cls.freq_24h_std,
+        deviation_mean: new_dev_mean,
+        deviation_std: new_dev_std,
+        duration_mean: new_dur_mean,
+        duration_std: cls.duration_std,
+        tod_mean: new_tod_mean,
+        tod_std: cls.tod_std,
+        hist_false_mean: new_hist_mean,
+        hist_false_std: cls.hist_false_std,
+        roc_mean: new_roc_mean,
+        roc_std: cls.roc_std,
+        abs_val_mean: new_abs_mean,
+        abs_val_std: cls.abs_val_std,
+        corr_fire_prob: new_corr_prob,
+    }
+}
+
+pub fn train_bayesian(
+    filter: BayesianFilter,
+    features: AlertFeatures,
+    is_false_alarm: bool
+) -> BayesianFilter {
+    n: u32 = filter.total_trained + 1
+    alpha: f32 = 2.0 / (float(n) + 1.0)
+    if alpha < 0.001 { alpha = 0.001 }  // Min learning rate
+    if alpha > 0.1 { alpha = 0.1 }      // Max learning rate
+
+    new_true_class: BayesianClass = filter.true_alarm_class
+    new_false_class: BayesianClass = filter.false_alarm_class
+
+    if is_false_alarm {
+        new_false_class = update_class_stats(filter.false_alarm_class, features, alpha)
+        // Update prior
+        false_count: f32 = float(new_false_class.count)
+        total_f: f32 = float(n)
+        new_prior: f32 = false_count / total_f
+        if new_prior > 0.95 { new_prior = 0.95 }
+        if new_prior < 0.05 { new_prior = 0.05 }
+        new_false_class = BayesianClass {
+            class_name: new_false_class.class_name,
+            prior: new_prior,
+            count: new_false_class.count,
+            freq_1h_mean: new_false_class.freq_1h_mean,
+            freq_1h_std: new_false_class.freq_1h_std,
+            freq_24h_mean: new_false_class.freq_24h_mean,
+            freq_24h_std: new_false_class.freq_24h_std,
+            deviation_mean: new_false_class.deviation_mean,
+            deviation_std: new_false_class.deviation_std,
+            duration_mean: new_false_class.duration_mean,
+            duration_std: new_false_class.duration_std,
+            tod_mean: new_false_class.tod_mean,
+            tod_std: new_false_class.tod_std,
+            hist_false_mean: new_false_class.hist_false_mean,
+            hist_false_std: new_false_class.hist_false_std,
+            roc_mean: new_false_class.roc_mean,
+            roc_std: new_false_class.roc_std,
+            abs_val_mean: new_false_class.abs_val_mean,
+            abs_val_std: new_false_class.abs_val_std,
+            corr_fire_prob: new_false_class.corr_fire_prob,
+        }
+        new_true_class = BayesianClass {
+            class_name: new_true_class.class_name,
+            prior: 1.0 - new_prior,
+            count: new_true_class.count,
+            freq_1h_mean: new_true_class.freq_1h_mean,
+            freq_1h_std: new_true_class.freq_1h_std,
+            freq_24h_mean: new_true_class.freq_24h_mean,
+            freq_24h_std: new_true_class.freq_24h_std,
+            deviation_mean: new_true_class.deviation_mean,
+            deviation_std: new_true_class.deviation_std,
+            duration_mean: new_true_class.duration_mean,
+            duration_std: new_true_class.duration_std,
+            tod_mean: new_true_class.tod_mean,
+            tod_std: new_true_class.tod_std,
+            hist_false_mean: new_true_class.hist_false_mean,
+            hist_false_std: new_true_class.hist_false_std,
+            roc_mean: new_true_class.roc_mean,
+            roc_std: new_true_class.roc_std,
+            abs_val_mean: new_true_class.abs_val_mean,
+            abs_val_std: new_true_class.abs_val_std,
+            corr_fire_prob: new_true_class.corr_fire_prob,
+        }
+    } else {
+        new_true_class = update_class_stats(filter.true_alarm_class, features, alpha)
+    }
+
+    BayesianFilter {
+        true_alarm_class: new_true_class,
+        false_alarm_class: new_false_class,
+        total_trained: n,
+        decision_threshold: filter.decision_threshold,
+        smoothing_factor: filter.smoothing_factor,
+        min_confidence: filter.min_confidence,
+        classification_count: filter.classification_count,
+        correct_count: filter.correct_count,
+    }
+}
+
+// ============================================================================
+// Batch Training from Historical Data
+// ============================================================================
+
+pub fn batch_train(
+    filter: BayesianFilter,
+    feature_list: array<AlertFeatures>,
+    labels: array<bool>            // true = false alarm, false = true alarm
+) -> BayesianFilter {
+    n: u32 = len(feature_list)
+    if n == 0 { return filter }
+    if n != len(labels) { return filter }
+
+    result: BayesianFilter = filter
+    i: u32 = 0
+    while i < n {
+        result = train_bayesian(result, feature_list[i], labels[i])
+        i = i + 1
+    }
+    return result
+}
+
+// ============================================================================
+// Feature Extraction Helper
+// ============================================================================
+
+pub fn extract_features(
+    value: f32,
+    threshold: f32,
+    baseline_mean: f32,
+    baseline_std: f32,
+    fires_last_1h: u32,
+    fires_last_24h: u32,
+    duration_sec: f32,
+    hour_of_day: u32,
+    correlated: bool,
+    hist_false_rate: f32,
+    prev_value: f32
+) -> AlertFeatures {
+    // Z-score deviation
+    deviation: f32 = 0.0
+    if baseline_std > 0.001 {
+        deviation = (value - baseline_mean) / baseline_std
+        if deviation < 0.0 { deviation = -deviation }
+    }
+
+    // Time of day score: 0=off hours (noisy), 1=business hours (meaningful)
+    tod_score: f32 = 0.3    // Default: off-hours
+    if hour_of_day >= 9 && hour_of_day <= 17 {
+        tod_score = 0.8     // Business hours
+    } else if hour_of_day >= 6 && hour_of_day <= 22 {
+        tod_score = 0.5     // Semi-active hours
+    }
+
+    // Rate of change
+    roc: f32 = 0.0
+    if prev_value > 0.001 {
+        roc = (value - prev_value) / prev_value
+    }
+
+    AlertFeatures {
+        frequency_1h: float(fires_last_1h),
+        frequency_24h: float(fires_last_24h),
+        deviation_sigma: deviation,
+        duration_sec: duration_sec,
+        time_of_day_score: tod_score,
+        correlated_firing: correlated,
+        hist_false_rate: hist_false_rate,
+        rate_of_change: roc,
+        absolute_value: value,
+    }
+}
+
+// ============================================================================
+// Model Accuracy Tracking
+// ============================================================================
+
+pub fn record_prediction(
+    filter: BayesianFilter,
+    predicted_false: bool,
+    actual_false: bool
+) -> BayesianFilter {
+    correct: bool = predicted_false == actual_false
+    new_correct: u32 = filter.correct_count
+    if correct { new_correct = new_correct + 1 }
+
+    BayesianFilter {
+        true_alarm_class: filter.true_alarm_class,
+        false_alarm_class: filter.false_alarm_class,
+        total_trained: filter.total_trained,
+        decision_threshold: filter.decision_threshold,
+        smoothing_factor: filter.smoothing_factor,
+        min_confidence: filter.min_confidence,
+        classification_count: filter.classification_count + 1,
+        correct_count: new_correct,
+    }
+}
+
+pub fn get_model_accuracy(filter: BayesianFilter) -> f32 {
+    if filter.classification_count == 0 {
+        return 0.0
+    }
+    return float(filter.correct_count) / float(filter.classification_count)
+}

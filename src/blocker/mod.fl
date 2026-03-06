@@ -1,0 +1,200 @@
+/**
+ * FreeLang Monitoring Suite: False-Reporting-Blocker Module
+ *
+ * 거짓 알람 차단 시스템 통합 API
+ *
+ * 무관용 규칙 10개:
+ *   R1: 거짓 알람 필터링 > 95%
+ *   R2: 정상 알람 통과 > 99%
+ *   R3: 처리 지연 < 100ms
+ *   R4: 이상 탐지 정확도 > 99%
+ *   R5: 메모리 < 100MB
+ *   R6: 데이터 보존 30days
+ *   R7: 스팸 탐지 99.9%
+ *   R8: False positive < 0.1%
+ *   R9: 추론 지연 < 10µs
+ *   R10: 모델 업데이트 < 1hour
+ */
+
+pub use "./bayesian_filter" as bayesian
+pub use "./time_series_analysis" as tsa
+
+// ============================================================================
+// False Reporting Blocker: Main System
+// ============================================================================
+
+pub struct FalseReportingBlocker {
+    metric_id: string,
+    bayesian: bayesian.BayesianFilter,
+    pattern_analyzer: tsa.PatternAnalyzer,
+    alert_context_buffer: array<bayesian.AlertContext>,
+    total_processed: u32,
+    total_suppressed: u32,
+    total_passed: u32,
+    false_suppressed: u32,     // Incorrectly suppressed (FP)
+    false_passed: u32,         // Incorrectly passed (FN)
+    last_model_update_ms: u64,
+}
+
+pub fn init_blocker(metric_id: string) -> FalseReportingBlocker {
+    FalseReportingBlocker {
+        metric_id: metric_id,
+        bayesian: bayesian.init_bayesian_filter(),
+        pattern_analyzer: tsa.init_pattern_analyzer(metric_id),
+        alert_context_buffer: [],
+        total_processed: 0,
+        total_suppressed: 0,
+        total_passed: 0,
+        false_suppressed: 0,
+        false_passed: 0,
+        last_model_update_ms: 0,
+    }
+}
+
+pub struct BlockerDecision {
+    should_suppress: bool,
+    confidence: f32,
+    reason: string,
+    classification: bayesian.ClassificationResult,
+    pattern_score: tsa.PatternAlarmScore,
+}
+
+pub fn evaluate_alert(
+    blocker: FalseReportingBlocker,
+    alert: bayesian.AlertContext,
+    features: bayesian.AlertFeatures,
+    now_ms: u64
+) -> tuple<FalseReportingBlocker, BlockerDecision> {
+    // 1. Bayesian classification
+    classification: bayesian.ClassificationResult = bayesian.classify(blocker.bayesian, features)
+
+    // 2. Pattern-based scoring
+    pattern_score: tsa.PatternAlarmScore = tsa.compute_pattern_alarm_score(
+        blocker.pattern_analyzer, alert.value, alert.threshold
+    )
+
+    // 3. Combined decision
+    combined_false_prob: f32 = classification.false_alarm_prob * 0.7 + pattern_score.score * 0.3
+
+    should_suppress: bool = false
+    reason: string = "passed"
+
+    if combined_false_prob > 0.60 {
+        should_suppress = true
+        if combined_false_prob > 0.85 {
+            reason = "high_confidence_false_alarm"
+        } else {
+            reason = "likely_false_alarm"
+        }
+    } else if classification.decision == "uncertain" {
+        reason = "uncertain_pass"
+    }
+
+    // Update counters
+    new_processed: u32 = blocker.total_processed + 1
+    new_suppressed: u32 = blocker.total_suppressed
+    new_passed: u32 = blocker.total_passed
+
+    if should_suppress {
+        new_suppressed = new_suppressed + 1
+    } else {
+        new_passed = new_passed + 1
+    }
+
+    // Update pattern analyzer
+    new_analyzer: tsa.PatternAnalyzer = tsa.update_analyzer_windows(
+        blocker.pattern_analyzer, alert.value, now_ms
+    )
+
+    // Periodically run analysis
+    need_analysis: bool = false
+    if new_processed % 100 == 0 {
+        need_analysis = true
+    }
+    if need_analysis {
+        new_analyzer = tsa.run_analysis(new_analyzer, now_ms)
+    }
+
+    // Update context buffer
+    new_buffer: array<bayesian.AlertContext> = blocker.alert_context_buffer
+    new_buffer = append(new_buffer, alert)
+    if len(new_buffer) > 10000 {
+        trimmed: array<bayesian.AlertContext> = []
+        start: u32 = len(new_buffer) - 10000
+        k: u32 = start
+        while k < len(new_buffer) {
+            trimmed = append(trimmed, new_buffer[k])
+            k = k + 1
+        }
+        new_buffer = trimmed
+    }
+
+    new_blocker: FalseReportingBlocker = FalseReportingBlocker {
+        metric_id: blocker.metric_id,
+        bayesian: blocker.bayesian,
+        pattern_analyzer: new_analyzer,
+        alert_context_buffer: new_buffer,
+        total_processed: new_processed,
+        total_suppressed: new_suppressed,
+        total_passed: new_passed,
+        false_suppressed: blocker.false_suppressed,
+        false_passed: blocker.false_passed,
+        last_model_update_ms: blocker.last_model_update_ms,
+    }
+
+    decision: BlockerDecision = BlockerDecision {
+        should_suppress: should_suppress,
+        confidence: combined_false_prob,
+        reason: reason,
+        classification: classification,
+        pattern_score: pattern_score,
+    }
+
+    return (new_blocker, decision)
+}
+
+// ============================================================================
+// Feedback Learning (R10: model update < 1 hour)
+// ============================================================================
+
+pub fn record_feedback(
+    blocker: FalseReportingBlocker,
+    features: bayesian.AlertFeatures,
+    was_false_alarm: bool,
+    now_ms: u64
+) -> FalseReportingBlocker {
+    updated_bayesian: bayesian.BayesianFilter = bayesian.train_bayesian(
+        blocker.bayesian, features, was_false_alarm
+    )
+
+    FalseReportingBlocker {
+        metric_id: blocker.metric_id,
+        bayesian: updated_bayesian,
+        pattern_analyzer: blocker.pattern_analyzer,
+        alert_context_buffer: blocker.alert_context_buffer,
+        total_processed: blocker.total_processed,
+        total_suppressed: blocker.total_suppressed,
+        total_passed: blocker.total_passed,
+        false_suppressed: blocker.false_suppressed,
+        false_passed: blocker.false_passed,
+        last_model_update_ms: now_ms,
+    }
+}
+
+// ============================================================================
+// Statistics
+// ============================================================================
+
+pub fn get_filter_rate(blocker: FalseReportingBlocker) -> f32 {
+    if blocker.total_processed == 0 { return 0.0 }
+    return float(blocker.total_suppressed) / float(blocker.total_processed)
+}
+
+pub fn get_pass_rate(blocker: FalseReportingBlocker) -> f32 {
+    if blocker.total_processed == 0 { return 0.0 }
+    return float(blocker.total_passed) / float(blocker.total_processed)
+}
+
+pub fn get_model_accuracy(blocker: FalseReportingBlocker) -> f32 {
+    return bayesian.get_model_accuracy(blocker.bayesian)
+}
